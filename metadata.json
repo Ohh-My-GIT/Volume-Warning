@@ -1,0 +1,6 @@
+{
+  "name": "音割れマシーン",
+  "description": "動画や音声ファイルを極限まで音割れ（ディストーション・歪み）加工するシンプルアプリ",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
