@@ -94,6 +94,9 @@ export default function App() {
     }
   };
 
+  // Ref for debouncing slider setting changes
+  const debounceTimerRef = useRef<any>(null);
+
   // Handle File Select / Drop
   const handleFileChange = async (selectedFile: File) => {
     if (!selectedFile) return;
@@ -117,12 +120,23 @@ export default function App() {
 
     try {
       const arrayBuffer = await selectedFile.arrayBuffer();
-      const tempCtx = new AudioContext();
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const tempCtx = new AudioContextClass();
+      if (tempCtx.state === 'suspended') {
+        await tempCtx.resume();
+      }
+
       setProcessingPercent(40);
       setProgressText('音声をデコード中...');
 
-      const decodedBuffer = await tempCtx.decodeAudioData(arrayBuffer);
-      await tempCtx.close();
+      const decodedBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
+        tempCtx.decodeAudioData(
+          arrayBuffer,
+          (buf) => resolve(buf),
+          (err) => reject(err || new Error('音声データのデコードに失敗しました'))
+        );
+      });
+      await tempCtx.close().catch(() => {});
 
       setRawAudioBuffer(decodedBuffer);
       setProcessingPercent(70);
@@ -142,7 +156,7 @@ export default function App() {
       setIsProcessing(false);
     } catch (err) {
       console.error(err);
-      alert('ファイルの読み込みに失敗しました。対応している音声/動画ファイルを選択してください。');
+      alert('ファイルの読み込み・デコードに失敗しました。他の形式（MP3/WAV/MP4など）でお試しください。');
       setIsProcessing(false);
     }
   };
@@ -188,7 +202,7 @@ export default function App() {
     }
   };
 
-  // Update slider setting
+  // Update slider setting (debounced for smooth dragging on mobile)
   const handleSettingChange = <K extends keyof DistortionSettings>(key: K, value: DistortionSettings[K]) => {
     setSelectedPreset('custom');
     const updated = { ...settings, [key]: value };
@@ -197,9 +211,16 @@ export default function App() {
     // Update live monitor gain immediately if playing
     if (key === 'masterVolume' && monitorGainRef.current) {
       monitorGainRef.current.gain.value = isMuted ? 0 : Number(value);
-    } else {
-      reprocessAudio(updated);
+      return;
     }
+
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(() => {
+      reprocessAudio(updated);
+    }, 200);
   };
 
   // Generate Distorted Video (Mux video + processed audio)
@@ -284,7 +305,8 @@ export default function App() {
 
     // Start Audio Context if needed
     if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-      audioCtxRef.current = new AudioContext();
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      audioCtxRef.current = new AudioContextClass();
     }
     const ctx = audioCtxRef.current;
     if (ctx.state === 'suspended') {
@@ -349,28 +371,26 @@ export default function App() {
     return `${baseName}_音割れ.${isMp4 ? 'mp4' : 'webm'}`;
   };
 
-  // Mobile Web Share / Camera Roll download trigger
-  const handleShareOrDownload = async (blob: Blob, filename: string) => {
-    if (navigator.canShare && navigator.canShare({ files: [new File([blob], filename, { type: blob.type })] })) {
+  // Mobile Web Share (Camera Roll / iOS File Share)
+  const handleShare = async (blob: Blob, filename: string) => {
+    if (!navigator.canShare) {
+      alert('お使いのブラウザは直接共有に対応していません。ダウンロードボタンをご利用ください。');
+      return;
+    }
+    const fileToShare = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+    if (navigator.canShare({ files: [fileToShare] })) {
       try {
         await navigator.share({
-          files: [new File([blob], filename, { type: blob.type })],
-          title: '音割れファイル',
+          files: [fileToShare],
+          title: 'Volume Warning',
           text: '音割れ加工したファイルです',
         });
-        return;
       } catch (err) {
-        // User cancelled or share failed, fallback to download link
+        // User cancelled share
       }
+    } else {
+      alert('直接共有に対応していないため、ダウンロードボタンをご利用ください。');
     }
-
-    // Direct download anchor
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
   };
 
   // Clean up canvas loop on unmount
@@ -392,7 +412,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-lg tracking-tight flex items-center gap-2 text-[#080f48]">
-                音割れマシーン
+                Volume Warning
                 <span className="text-xs font-bold px-2 py-0.5 rounded bg-[#080f48] text-[#ffd400]">
                   極限歪み加工
                 </span>
@@ -461,7 +481,10 @@ export default function App() {
         {/* Processing Indicator */}
         {isProcessing && (
           <div className="bg-[#050a33] border border-[#ffd400] rounded-2xl p-6 text-center space-y-3 shadow-lg">
-            <div className="text-3xl">🔊💥</div>
+            <div className="text-3xl flex justify-center items-center gap-3">
+              <i className="fa-solid fa-volume-high text-[#ffd400]"></i>
+              <i className="fa-solid fa-bolt text-[#ffd400]"></i>
+            </div>
             <p className="text-sm font-bold text-[#ffd400]">{progressText}</p>
             <div className="w-full bg-[#080f48] h-3 rounded-full overflow-hidden border border-[#ffd400]/30">
               <div
@@ -578,9 +601,11 @@ export default function App() {
                         : 'bg-[#050a33] border-[#ffd400]/40 text-[#ffd400]'
                     }`}
                   >
-                    <span className={`text-2xl p-1 rounded-lg border ${
-                      selectedPreset === key ? 'bg-[#080f48] text-[#ffd400] border-[#080f48]' : 'bg-[#080f48] border-[#ffd400]/30'
-                    }`}>{p.icon}</span>
+                    <span className={`w-10 h-10 flex items-center justify-center rounded-lg border text-lg ${
+                      selectedPreset === key ? 'bg-[#080f48] text-[#ffd400] border-[#080f48]' : 'bg-[#080f48] text-[#ffd400] border-[#ffd400]/30'
+                    }`}>
+                      <i className={p.icon}></i>
+                    </span>
                     <div className="flex-1 min-w-0">
                       <div className={`font-bold text-sm ${selectedPreset === key ? 'text-[#080f48]' : 'text-[#ffd400]'}`}>{p.name}</div>
                       <div className={`text-xs mt-0.5 leading-snug ${selectedPreset === key ? 'text-[#080f48]/80' : 'text-[#ffd400]/80'}`}>{p.desc}</div>
@@ -689,13 +714,26 @@ export default function App() {
                         : '無圧縮高品質WAVフォーマットで音割れ音声を保存します。'}
                     </p>
                   </div>
-                  {exportWavBlob && (
-                    <button
-                      onClick={() => handleShareOrDownload(exportWavBlob, getWavOutputFilename())}
-                      className="w-full bg-[#ffd400] text-[#080f48] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2"
-                    >
-                      <Download className="w-4 h-4" /> {getWavOutputFilename()} を保存
-                    </button>
+                  {exportWavBlob && exportWavUrl && (
+                    <div className="space-y-2">
+                      <a
+                        href={exportWavUrl}
+                        download={getWavOutputFilename()}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-full bg-[#ffd400] text-[#080f48] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2 shadow-md hover:brightness-105 active:scale-95 transition"
+                      >
+                        <Download className="w-4 h-4" /> {getWavOutputFilename()} を保存
+                      </a>
+                      {typeof navigator !== 'undefined' && 'canShare' in navigator && (
+                        <button
+                          onClick={() => handleShare(exportWavBlob, getWavOutputFilename())}
+                          className="w-full bg-[#080f48] text-[#ffd400] border border-[#ffd400]/40 font-bold py-1.5 px-3 rounded-lg text-xs flex items-center justify-center gap-1.5 hover:bg-[#121e82] transition"
+                        >
+                          <Share2 className="w-3.5 h-3.5" /> 共有メニューで保存（iPhone/Android）
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -711,17 +749,31 @@ export default function App() {
                       </p>
                     </div>
 
-                    {exportVideoBlob ? (
-                      <button
-                        onClick={() => handleShareOrDownload(exportVideoBlob, getVideoOutputFilename())}
-                        className="w-full bg-[#ffd400] text-[#080f48] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2"
-                      >
-                        <Download className="w-4 h-4" /> {getVideoOutputFilename()} を保存
-                      </button>
+                    {exportVideoBlob && exportVideoUrl ? (
+                      <div className="space-y-2">
+                        <a
+                          href={exportVideoUrl}
+                          download={getVideoOutputFilename()}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="w-full bg-[#ffd400] text-[#080f48] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2 shadow-md hover:brightness-105 active:scale-95 transition"
+                        >
+                          <Download className="w-4 h-4" /> {getVideoOutputFilename()} を保存
+                        </a>
+                        {typeof navigator !== 'undefined' && 'canShare' in navigator && (
+                          <button
+                            onClick={() => handleShare(exportVideoBlob, getVideoOutputFilename())}
+                            className="w-full bg-[#080f48] text-[#ffd400] border border-[#ffd400]/40 font-bold py-1.5 px-3 rounded-lg text-xs flex items-center justify-center gap-1.5 hover:bg-[#121e82] transition"
+                          >
+                            <Share2 className="w-3.5 h-3.5" /> カメラロールへ直接共有
+                          </button>
+                        )}
+                      </div>
                     ) : (
                       <button
                         onClick={handleGenerateVideo}
-                        className="w-full bg-[#080f48] text-[#ffd400] border border-[#ffd400] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2"
+                        disabled={isProcessing}
+                        className="w-full bg-[#080f48] text-[#ffd400] border border-[#ffd400] font-bold py-2.5 px-4 rounded-lg text-sm flex items-center justify-center gap-2 hover:bg-[#121e82] transition"
                       >
                         <FilmIcon className="w-4 h-4" /> 音割れ動画を作成・書き出し
                       </button>
@@ -751,7 +803,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-[#ffd400]/20 py-4 text-center text-xs text-[#ffd400]/70">
-        音割れマシーン • Web Audio API 高速音声ディストーション処理
+        Volume Warning • Web Audio API 高速音声ディストーション処理
       </footer>
     </div>
   );

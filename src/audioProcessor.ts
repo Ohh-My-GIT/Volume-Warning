@@ -15,7 +15,7 @@ export interface DistortionSettings {
 export const PRESETS: Record<string, { name: string; icon: string; desc: string; settings: DistortionSettings }> = {
   standard: {
     name: '定番・爆音音割れ',
-    icon: '🔊',
+    icon: 'fa-solid fa-volume-high',
     desc: '全体を大音量でクリッピングさせた王道の音割れ',
     settings: {
       gain: 25,
@@ -28,7 +28,7 @@ export const PRESETS: Record<string, { name: string; icon: string; desc: string;
   },
   earrape: {
     name: 'スピーカー崩壊（極太爆音）',
-    icon: '💥',
+    icon: 'fa-solid fa-bomb',
     desc: '低音を激しく増幅して画面ごと揺れる爆音歪み',
     settings: {
       gain: 50,
@@ -41,7 +41,7 @@ export const PRESETS: Record<string, { name: string; icon: string; desc: string;
   },
   bitcrush: {
     name: '8-Bit レトロノイズ',
-    icon: '👾',
+    icon: 'fa-solid fa-gamepad',
     desc: 'ファミコン風の量子化ビットクラッシュ音割れ',
     settings: {
       gain: 15,
@@ -54,7 +54,7 @@ export const PRESETS: Record<string, { name: string; icon: string; desc: string;
   },
   apocalypse: {
     name: '宇宙崩壊（次元の歪み）',
-    icon: '🌋',
+    icon: 'fa-solid fa-meteor',
     desc: '原形をとどめない極限限界まで破壊されたサウンド',
     settings: {
       gain: 100,
@@ -123,11 +123,12 @@ export async function processAudioBuffer(
   inputBuffer: AudioBuffer,
   settings: DistortionSettings
 ): Promise<AudioBuffer> {
-  const channels = inputBuffer.numberOfChannels;
+  const channels = Math.min(inputBuffer.numberOfChannels, 2);
   const sampleRate = inputBuffer.sampleRate;
   const length = inputBuffer.length;
 
-  const offlineCtx = new OfflineAudioContext(channels, length, sampleRate);
+  const OfflineContextClass = window.OfflineAudioContext || (window as any).webkitOfflineAudioContext;
+  const offlineCtx = new OfflineContextClass(channels, length, sampleRate);
 
   // Source node
   const source = offlineCtx.createBufferSource();
@@ -152,7 +153,7 @@ export async function processAudioBuffer(
   // WaveShaper Node for Distortion Clipping
   const waveshaper = offlineCtx.createWaveShaper();
   waveshaper.curve = makeDistortionCurve(settings.clippingType, settings.gain);
-  waveshaper.oversample = '4x';
+  waveshaper.oversample = '2x';
 
   // Connect Audio Graph
   // source -> preGain -> bassFilter -> highFilter -> waveshaper -> offlineCtx.destination
@@ -164,11 +165,29 @@ export async function processAudioBuffer(
 
   source.start(0);
 
-  // Render processed buffer
-  const renderedBuffer = await offlineCtx.startRendering();
-
-  // Apply bit depth reduction if requested
-  return applyBitcrush(renderedBuffer, settings.bitDepth);
+  // Render processed buffer with callback fallback for older mobile Safari
+  if (offlineCtx.startRendering) {
+    try {
+      const renderedBuffer = await offlineCtx.startRendering();
+      return applyBitcrush(renderedBuffer, settings.bitDepth);
+    } catch (e) {
+      return new Promise((resolve, reject) => {
+        offlineCtx.oncomplete = (e) => {
+          resolve(applyBitcrush(e.renderedBuffer, settings.bitDepth));
+        };
+        offlineCtx.onerror = (err) => reject(err);
+        offlineCtx.startRendering();
+      });
+    }
+  } else {
+    return new Promise((resolve, reject) => {
+      offlineCtx.oncomplete = (e) => {
+        resolve(applyBitcrush(e.renderedBuffer, settings.bitDepth));
+      };
+      offlineCtx.onerror = (err) => reject(err);
+      offlineCtx.startRendering();
+    });
+  }
 }
 
 /**
@@ -249,6 +268,8 @@ export async function renderDistortedVideo(
     const videoEl = document.createElement('video');
     videoEl.muted = true;
     videoEl.playsInline = true;
+    videoEl.setAttribute('playsinline', 'true');
+    videoEl.setAttribute('webkit-playsinline', 'true');
     videoEl.crossOrigin = 'anonymous';
 
     const videoUrl = URL.createObjectURL(videoFile);
@@ -271,7 +292,12 @@ export async function renderDistortedVideo(
         }
 
         // Setup Web Audio Stream for recorded distorted audio
-        const audioCtx = new AudioContext();
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const audioCtx = new AudioContextClass();
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+
         const source = audioCtx.createBufferSource();
         source.buffer = distortedAudioBuffer;
 
@@ -279,7 +305,17 @@ export async function renderDistortedVideo(
         source.connect(streamDestination);
 
         // Canvas video stream (30 fps)
-        const canvasStream = canvas.captureStream(30);
+        const canvasStream = (canvas as any).captureStream
+          ? (canvas as any).captureStream(30)
+          : (canvas as any).mozCaptureStream
+          ? (canvas as any).mozCaptureStream(30)
+          : null;
+
+        if (!canvasStream) {
+          reject(new Error('お使いのブラウザは動画のキャンバスキャプチャに対応していません。'));
+          return;
+        }
+
         const combinedTracks = [
           ...canvasStream.getVideoTracks(),
           ...streamDestination.stream.getAudioTracks(),
@@ -287,18 +323,23 @@ export async function renderDistortedVideo(
         const combinedStream = new MediaStream(combinedTracks);
 
         // Pick supported mimeType for maximum mobile/desktop compatibility
-        let mimeType = 'video/mp4;codecs=avc1,mp4a.40.2';
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
-          mimeType = 'video/mp4';
-        }
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
-          mimeType = 'video/webm;codecs=vp9,opus';
-        }
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
-          mimeType = 'video/webm';
+        const possibleTypes = [
+          'video/mp4;codecs=avc1,mp4a.40.2',
+          'video/mp4;codecs=avc1',
+          'video/mp4',
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm'
+        ];
+        let mimeType = possibleTypes.find(t => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) || '';
+
+        if (!mimeType) {
+          mimeType = 'video/mp4'; // fallback
         }
 
-        const mediaRecorder = new MediaRecorder(combinedStream, { mimeType });
+        const mediaRecorder = new MediaRecorder(combinedStream, {
+          mimeType: mimeType || undefined
+        });
         const chunks: Blob[] = [];
 
         mediaRecorder.ondataavailable = (e) => {
@@ -307,20 +348,24 @@ export async function renderDistortedVideo(
 
         mediaRecorder.onstop = () => {
           URL.revokeObjectURL(videoUrl);
-          audioCtx.close();
-          const finalBlob = new Blob(chunks, { type: mimeType });
+          audioCtx.close().catch(() => {});
+          const finalBlob = new Blob(chunks, { type: mimeType || 'video/mp4' });
           resolve(finalBlob);
         };
 
         // Start playing video and audio in sync
         videoEl.currentTime = 0;
-        await videoEl.play();
+        await videoEl.play().catch((err) => {
+          console.warn('Video play warning:', err);
+        });
         source.start(0);
         mediaRecorder.start(100);
 
         const drawFrame = () => {
           if (videoEl.ended || videoEl.paused) {
-            mediaRecorder.stop();
+            if (mediaRecorder.state !== 'inactive') {
+              mediaRecorder.stop();
+            }
             return;
           }
           ctx.drawImage(videoEl, 0, 0, width, height);
@@ -349,7 +394,7 @@ export async function renderDistortedVideo(
       }
     };
 
-    videoEl.onerror = (e) => {
+    videoEl.onerror = () => {
       URL.revokeObjectURL(videoUrl);
       reject(new Error('動画の読み込みに失敗しました'));
     };
